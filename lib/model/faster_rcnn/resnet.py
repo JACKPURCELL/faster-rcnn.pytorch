@@ -30,7 +30,7 @@ def conv3x3(in_planes, out_planes, stride=1):
   return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
            padding=1, bias=False)
 
-
+# tips: will not be use in resnet101
 class BasicBlock(nn.Module):
   expansion = 1
 
@@ -79,6 +79,7 @@ class Bottleneck(nn.Module):
     self.downsample = downsample
     self.stride = stride
 
+# tips: will not use forward here
   def forward(self, x):
     residual = x
 

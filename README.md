@@ -1,5 +1,5 @@
 # A *Faster* Pytorch Implementation of Faster R-CNN
-a
+
 ## Introduction
 
 ### Good news! This repo supports pytorch-1.0 now!!! We borrowed some code and techniques from [maskrcnn-benchmark](https://github.com/facebookresearch/maskrcnn-benchmark).
