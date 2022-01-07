@@ -4,6 +4,7 @@ from __future__ import print_function
 
 from model.utils.config import cfg
 from model.faster_rcnn.faster_rcnn import _fasterRCNN
+from PASS import KMMaskScheme, RunningMode, MaskMode, MaskGate
 
 import torch
 import torch.nn as nn
@@ -29,6 +30,110 @@ def conv3x3(in_planes, out_planes, stride=1):
   "3x3 convolution with padding"
   return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
            padding=1, bias=False)
+
+
+def construct_skip(now_input, previous_input, hidden_dim, skip_rate=0.5, patch_size=8, Mask_indices = None, Mask_Mode = MaskMode.Origin):
+    # return now_input
+    h, w = now_input.shape[2:]
+    if h != w or previous_input is None or previous_input.size() != now_input.size():
+        return now_input
+    patch_num = h // patch_size
+    if cfg.KMMask == KMMaskScheme.Topk:
+        indices = get_indices(now_input, previous_input, skip_rate, patch_size)
+    else:
+        indices = Mask_indices
+    mask = get_mask(now_input.shape[:], patch_size, skip_rate, cfg.KMMask, indices)
+    cfg.skipped_count += len(indices)
+    cfg.total_patch_num += patch_num*patch_num
+    # now_input = torch.mul(now_input, mask1) + torch.mul(previous_input, mask2)
+    # now_input = torch.mul(previous_input, mask1) + torch.mul(now_input, mask2)
+    # if Mask_Mode == MaskMode.Positive:
+    #     now_input = torch.mul(now_input, mask) + torch.mul(previous_input, 1-mask)
+    # if Mask_Mode == MaskMode.Negative:
+    #     now_input = torch.mul(now_input, 1-mask) + torch.mul(previous_input, mask)
+        # print(1-mask)
+    # res = torch.logical_and(mask, 1-mask)
+    # print("logical_and: {}".format(res))
+
+    if Mask_Mode == MaskMode.Positive:
+        h_out = h
+        w_out = w
+        now_input = torch.mul(previous_input, mask) + torch.mul(now_input, 1-mask)
+        # show_feature_map(mask)
+        current_mac = cfg.batch_size * h_out * w_out * hidden_dim
+        cfg.total_mac += current_mac
+        cfg.skipped_mac += current_mac * skip_rate
+    if Mask_Mode == MaskMode.Negative:
+        now_input = torch.mul(now_input, mask) + torch.mul(previous_input, 1-mask)
+
+    return now_input
+
+
+def get_indices(now_input, previous_input, skip_rate=0.5, patch_size=8):
+    h, w = now_input.shape[2:]
+    if h != w:
+        return []
+    frames = []
+    dh = patch_size
+    patch_num = h // dh
+    indices_arr = torch.tensor([]).to('cuda')
+    for i in range(0, h, dh):
+        for j in range(0, w, dh):
+            f = now_input[:, :, i:i + dh, j:j + dh]
+            if previous_input is not None:
+                p = previous_input[:, :, i:i + dh, j:j + dh]
+                simi = torch.tensor([torch.mean(torch.cosine_similarity(f, p))]).to("cuda")
+            else:
+                simi = torch.FloatTensor([1]).to("cuda")
+            # if indices_arr is None:
+            #     indices_arr = simi
+            # else:
+            indices_arr = torch.cat((indices_arr, simi), dim=0)
+            
+    # patch_num = patch_per_row * patch_per_row
+    # indices = ???
+    k = int(patch_num*patch_num*skip_rate)
+    ans = torch.topk(indices_arr, k).indices
+    return ans
+    # return indice
+
+
+def get_mask(tensor_shape, patch_size=8, skip_rate = 0.5, mask_scheme=KMMaskScheme.Bernoulli, indices=None):
+    h, w = tensor_shape[2:]
+    if h != w:
+        raise ValueError('Tensor shape is not square, the height is not equal to width !!!')
+    
+    patch_per_row = h // patch_size
+    mask = torch.zeros(tensor_shape[0], tensor_shape[1], patch_per_row, patch_per_row).to("cuda")
+    
+    if mask_scheme == KMMaskScheme.Bernoulli:
+        mask = torch.ones(1, 1, patch_per_row, patch_per_row).to("cuda")
+        mask = torch.bernoulli(mask * skip_rate)
+        m = torch.nn.Upsample(scale_factor=patch_size, mode='nearest')
+        mask = m(mask)
+        mask = mask.reshape(h,h)
+    if mask_scheme == KMMaskScheme.RandomSampling:
+        patch_num = patch_per_row * patch_per_row
+        indices = torch.randperm(patch_num)[:int(patch_num*(skip_rate))]
+        mask = torch.reshape(mask, (patch_per_row, patch_per_row, tensor_shape[0]*tensor_shape[1]))
+        mask[:,:, indices] = 0
+        mask = torch.reshape(mask, (tensor_shape[0], tensor_shape[1], patch_per_row, patch_per_row))
+        m = torch.nn.Upsample(scale_factor=patch_size, mode='nearest')
+        mask = m(mask)
+    if mask_scheme == KMMaskScheme.Topk or mask_scheme == KMMaskScheme.Learning:
+        # mask = torch.reshape(mask, (patch_per_row*patch_per_row, tensor_shape[0]*tensor_shape[1]))
+        mask = torch.reshape(mask, (tensor_shape[0], tensor_shape[1], patch_per_row*patch_per_row))
+        # mask = torch.transpose(mask, 0, 1)
+        # mask[indices] = 0
+        # mask = torch.transpose(mask, 0, 1)
+        mask[:,:, indices] = 1
+        mask = torch.reshape(mask, (tensor_shape[0], tensor_shape[1], patch_per_row, patch_per_row))
+        m = torch.nn.Upsample(scale_factor=patch_size, mode='nearest')
+        mask = m(mask)
+
+    return mask
+
+    
 
 # tips: will not be use in resnet101
 class BasicBlock(nn.Module):
@@ -78,20 +183,202 @@ class Bottleneck(nn.Module):
     self.relu = nn.ReLU(inplace=True)
     self.downsample = downsample
     self.stride = stride
+    if cfg.mode != RunningMode.BackboneTest :
+        self.Gate1 = MaskGate(patch_size=self.patch_size, patch_num=self.patch_num, pretrain_flag=cfg.mode, input_channel=512, output_channel=planes).cuda()
+        self.Gate1.init_weights()
+        self.Gate2 = MaskGate(patch_size=self.patch_size, patch_num=self.patch_num, pretrain_flag=cfg.mode, input_channel=512, output_channel=planes).cuda()
+        self.Gate2.init_weights()
+        self.Gate3 = MaskGate(patch_size=self.patch_size, patch_num=self.patch_num, pretrain_flag=cfg.mode, input_channel=512, output_channel=planes).cuda()
+        self.Gate3.init_weights()
+    else:
+        self.Gate1 = None 
+        self.Gate2 = None 
+        self.Gate3 = None 
 
-# tips: will not use forward here
+
+  def set_flag(self, Mask_Mode, skip_rate, topk_skip = False):
+      self.Mask_Mode = Mask_Mode
+      self.skip_rate = skip_rate
+      self.topk_skip = topk_skip
+
+
   def forward(self, x):
     residual = x
 
-    out = self.conv1(x)
+    # out = self.conv1(x)
+    if self.Mask_Mode == MaskMode.Origin: #no mask set
+        if (cfg.mode == RunningMode.GatePreTrain
+                or cfg.mode == RunningMode.FineTuning
+                or cfg.mode == RunningMode.Test
+                or cfg.mode == RunningMode.BackboneTest):
+            self.previous_x = torch.clone(x).detach()
+        if self.use_res_connect:
+            out = x + self.conv1(x)
+        else:
+            out = self.conv1(x)
+
+    if cfg.KMMask == KMMaskScheme.Learning:
+        if self.previous_x is None: # first frame. previous_x only set in origin mask
+            # if cfg.mode == RunningMode.FineTuning or cfg.mode == RunningMode.Test:
+            #     self.previous_x = torch.clone(out).detach()
+            if self.use_res_connect:
+                out = x + self.conv1(x)
+            else:
+                out = self.conv1(x)
+        if x.size() != self.previous_x.size(): #when batch size is not dividable do not skip
+            if self.use_res_connect:
+                out = x + self.conv1(x)
+            else:
+                out = self.conv1(x)
+
+        if self.Gate1 is not None:
+            x = self.Gate1(x, self.previous_x, self.Mask_Mode, running_mode = cfg.mode)
+            # if self.Mask_Mode == cfg.MaskMode.Origin:
+            #     self.previous_x = torch.clone(out).detach()
+            if self.use_res_connect:
+                out = x + self.conv1(x)
+            else:
+                out = self.conv1(x)
+
+        if self.Gate1 is None:
+            if self.use_res_connect:
+                out = x + self.conv1(x)
+            else:
+                out = self.conv1(x)
+
+    if cfg.KMMask != KMMaskScheme.Learning: # non-learning mode
+        if self.topk_skip:
+            x = construct_skip(x, self.previous_x, hidden_dim=self.hidden_dim, skip_rate=self.skip_rate, patch_size=self.patch_size,
+                            Mask_Mode=self.Mask_Mode)
+            # if self.Mask_Mode == MaskMode.Positive:
+            #     x = torch.mul(self.previous_x, mask) + torch.mul(x, 1 - mask)
+            # if self.Mask_Mode == MaskMode.Negative:
+            #     x = torch.mul(x, mask) + torch.mul(self.previous_x, 1 - mask)
+        if self.use_res_connect:
+            out = x + self.conv1(x)
+        else:
+            out = self.conv1(x)
+  
+    # ----- out = self.conv1(x) end
+
     out = self.bn1(out)
     out = self.relu(out)
 
-    out = self.conv2(out)
+    # out = self.conv2(out)
+    if self.Mask_Mode == MaskMode.Origin: #no mask set
+        if (cfg.mode == RunningMode.GatePreTrain
+                or cfg.mode == RunningMode.FineTuning
+                or cfg.mode == RunningMode.Test
+                or cfg.mode == RunningMode.BackboneTest):
+            self.previous_x = torch.clone(out).detach()
+        if self.use_res_connect:
+            out = out + self.conv2(out)
+        else:
+            out = self.conv2(out)
+
+    if cfg.KMMask == KMMaskScheme.Learning:
+        if self.previous_x is None: # first frame. previous_x only set in origin mask
+            # if cfg.mode == RunningMode.FineTuning or cfg.mode == RunningMode.Test:
+            #     self.previous_x = torch.clone(out).detach()
+            if self.use_res_connect:
+                out = out + self.conv2(out)
+            else:
+                out = self.conv2(out)
+        if out.size() != self.previous_x.size(): #when batch size is not dividable do not skip
+            if self.use_res_connect:
+                out = out + self.conv2(out)
+            else:
+                out = self.conv2(out)
+
+        if self.Gate2 is not None:
+            out = self.Gate2(out, self.previous_x, self.Mask_Mode, running_mode = cfg.mode)
+            # if self.Mask_Mode == cfg.MaskMode.Origin:
+            #     self.previous_x = torch.clone(out).detach()
+            if self.use_res_connect:
+                out = out + self.conv2(out)
+            else:
+                out = self.conv2(out)
+
+        if self.Gate2 is None:
+            if self.use_res_connect:
+                out = out + self.conv2(out)
+            else:
+                out = self.conv2(out)
+
+    if cfg.KMMask != KMMaskScheme.Learning: # non-learning mode
+        if self.topk_skip:
+            out = construct_skip(out, self.previous_x, hidden_dim=self.hidden_dim, skip_rate=self.skip_rate, patch_size=self.patch_size,
+                            Mask_Mode=self.Mask_Mode)
+            # if self.Mask_Mode == MaskMode.Positive:
+            #     x = torch.mul(self.previous_x, mask) + torch.mul(x, 1 - mask)
+            # if self.Mask_Mode == MaskMode.Negative:
+            #     x = torch.mul(x, mask) + torch.mul(self.previous_x, 1 - mask)
+        if self.use_res_connect:
+            out = out + self.conv2(out)
+        else:
+            out = self.conv2(out)
+  
+    # ----- out = self.conv2(out) end
+
     out = self.bn2(out)
     out = self.relu(out)
 
-    out = self.conv3(out)
+    # out = self.conv3(out)
+    if self.Mask_Mode == MaskMode.Origin: #no mask set
+        if (cfg.mode == RunningMode.GatePreTrain
+                or cfg.mode == RunningMode.FineTuning
+                or cfg.mode == RunningMode.Test
+                or cfg.mode == RunningMode.BackboneTest):
+            self.previous_x = torch.clone(out).detach()
+        if self.use_res_connect:
+            out = out + self.conv3(out)
+        else:
+            out = self.conv3(out)
+
+    if cfg.KMMask == KMMaskScheme.Learning:
+        if self.previous_x is None: # first frame. previous_x only set in origin mask
+            # if cfg.mode == RunningMode.FineTuning or cfg.mode == RunningMode.Test:
+            #     self.previous_x = torch.clone(out).detach()
+            if self.use_res_connect:
+                out = out + self.conv3(out)
+            else:
+                out = self.conv3(out)
+        if out.size() != self.previous_x.size(): #when batch size is not dividable do not skip
+            if self.use_res_connect:
+                out = out + self.conv3(out)
+            else:
+                out = self.conv3(out)
+
+        if self.Gate3 is not None:
+            out = self.Gate3(out, self.previous_x, self.Mask_Mode, running_mode = cfg.mode)
+            # if self.Mask_Mode == cfg.MaskMode.Origin:
+            #     self.previous_x = torch.clone(out).detach()
+            if self.use_res_connect:
+                out = out + self.conv3(out)
+            else:
+                out = self.conv3(out)
+
+        if self.Gate3 is None:
+            if self.use_res_connect:
+                out = out + self.conv3(out)
+            else:
+                out = self.conv3(out)
+
+    if cfg.KMMask != KMMaskScheme.Learning: # non-learning mode
+        if self.topk_skip:
+            out = construct_skip(out, self.previous_x, hidden_dim=self.hidden_dim, skip_rate=self.skip_rate, patch_size=self.patch_size,
+                            Mask_Mode=self.Mask_Mode)
+            # if self.Mask_Mode == MaskMode.Positive:
+            #     x = torch.mul(self.previous_x, mask) + torch.mul(x, 1 - mask)
+            # if self.Mask_Mode == MaskMode.Negative:
+            #     x = torch.mul(x, mask) + torch.mul(self.previous_x, 1 - mask)
+        if self.use_res_connect:
+            out = out + self.conv3(out)
+        else:
+            out = self.conv3(out)
+   
+    # ----- out = self.conv3(out) end
+
     out = self.bn3(out)
 
     if self.downsample is not None:
